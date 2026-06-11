@@ -1,2 +1,6 @@
 # 2WD-LineTracking-Car
-Line Tracking Car Project
+👥 團隊資訊
+* **隊伍號碼**：第28隊
+* **團隊成員**：
+蘇楷茗 (學號: E64134077)
+吳宇民 (學號: E94149010)  
