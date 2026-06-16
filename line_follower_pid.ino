@@ -1,5 +1,18 @@
 #include <Arduino.h>
 
+// Set to 1 while tuning through Serial Monitor, then set to 0 for competition.
+#define DEBUG 0
+
+#if DEBUG
+#define DEBUG_BEGIN(...) Serial.begin(__VA_ARGS__)
+#define DEBUG_PRINTLN(...) Serial.println(__VA_ARGS__)
+#define DEBUG_PRINTF(...) Serial.printf(__VA_ARGS__)
+#else
+#define DEBUG_BEGIN(...)
+#define DEBUG_PRINTLN(...)
+#define DEBUG_PRINTF(...)
+#endif
+
 // =====================
 // Sensor pins (confirmed correct)
 // =====================
@@ -17,11 +30,19 @@ const int IN3 = 15;
 const int IN4 = 4;
 
 // =====================
-// RGB LED pins
+// ASL / status LED pins
 // =====================
 const int LED_R = 17;
 const int LED_G = 16;
-const int LED_B = 5;
+const int LED_B = 5; // Unused if the car only has red/green LEDs.
+
+// =====================
+// Start button
+// =====================
+// Uses the ESP32 DevKit BOOT button on GPIO0. Press it after power-on to start.
+// Do not hold BOOT while resetting or powering on, or the board may enter flash mode.
+const int START_BUTTON_PIN = 0;
+const int START_BUTTON_ACTIVE_LEVEL = LOW;
 
 // =====================
 // PWM
@@ -32,49 +53,43 @@ const int PWM_BITS = 8;
 // =====================
 // Drive tuning
 // =====================
-const int BASE_SPEED = 170;
-const int LEFT_MOTOR_OFFSET = 25;
+const int BASE_SPEED = 200;
 const int LEFT_MOTOR_POWER_BOOST = 30;
-const float STRAIGHT_ERROR_LIMIT = 0.25;
-const int MAX_PD_CORRECTION = 55;
+const float STRAIGHT_ERROR_LIMIT = 0.40;
+const float STRAIGHT_RELEASE_LIMIT = 0.75;
+const int MAX_PD_CORRECTION = 44;
 
-// Back-up-align tuning. When the line is on a side sensor, the car backs up
-// while correcting its heading until the center sensor sees the line again.
-const int RIGHT_ALIGN_LEFT_BACK = 190;
-const int RIGHT_ALIGN_RIGHT_BACK = 230;
-const int LEFT_ALIGN_LEFT_BACK = 210;
-const int LEFT_ALIGN_RIGHT_BACK = 170;
-const int CORNER_KICK_FORWARD = 230;
-const int CORNER_KICK_REVERSE = -150;
-const unsigned long CORNER_KICK_TIME = 120;
-const unsigned long ALIGN_BRAKE_TIME = 0;
-const unsigned long ALIGN_LIMIT = 650;
+// Caster-wheel alignment tuning. When an outer sensor catches the line,
+// keep turning into that direction until the center sensor returns.
+const int ALIGN_TURN_FORWARD = 225;
+const int ALIGN_TURN_REVERSE = -125;
+const unsigned long ALIGN_LIMIT = 900;
 
-// Lost-line recovery: brake, back up briefly, then turn toward last error.
-const int SEARCH_BACK_SPEED = 170;
-const int SEARCH_TURN_FORWARD = 165;
-const int SEARCH_TURN_REVERSE = -70;
-const unsigned long SEARCH_BRAKE_TIME = 0;
-const unsigned long SEARCH_BACK_TIME = 350;
-const unsigned long SEARCH_PULSE_TIME = 80;
-const unsigned long SEARCH_REST_TIME = 35;
-const unsigned long LOST_LIMIT = 1100;
-const unsigned long LOST_LIMIT_FINISH_PHASE = 7000;
+// Lost-line recovery: make a long sweep instead of a small left/right shake.
+const int SEARCH_TURN_FORWARD = 215;
+const int SEARCH_TURN_REVERSE = -120;
+const unsigned long SEARCH_PRIMARY_TIME = 850;
+const unsigned long SEARCH_REST_TIME = 10;
+const unsigned long SEARCH_OPPOSITE_TIME = 850;
+const unsigned long LOST_LIMIT = 2400;
 
-// Finish logic: after 60 seconds, stop after seeing stable straight line twice.
-const int FINISH_STRAIGHT_CONFIRM_COUNT = 8;
-const int FINISH_STRAIGHT_EVENT_TARGET = 2;
-const unsigned long FINISH_STRAIGHT_CONFIRM_TIME = 350;
-const unsigned long FINISH_ENABLE_TIME = 60000;
+// Finish logic: stop when the line ends after a stable straight approach.
+const unsigned long FINISH_APPROACH_STRAIGHT_TIME = 80;
+const unsigned long FINISH_LINE_END_CONFIRM_TIME = 90;
+const unsigned long FINISH_RECOVERY_IGNORE_TIME = 900;
 
 // =====================
 // PD parameters
 // =====================
-const float KP = 45.0;
-const float KD = 70.0;
+const float KP = 40.0;
+const float KD = 55.0;
+const float ERROR_FILTER_ALPHA = 0.30;
 
 float error = 0.0;
 float lastError = 0.0;
+float filteredError = 0.0;
+bool errorFilterReady = false;
+bool straightMode = false;
 
 // =====================
 // State machine
@@ -91,19 +106,37 @@ enum CarState
 CarState state = READY;
 unsigned long lostTime = 0;
 unsigned long alignTime = 0;
-unsigned long straightStartTime = 0;
-unsigned long finishStraightStartTime = 0;
-unsigned long startTime = 0;
-int finishConfirmCount = 0;
-int finishEventCount = 0;
+unsigned long finishApproachStartTime = 0;
+unsigned long finishLineEndStartTime = 0;
+unsigned long lastRecoveryTime = 0;
 int alignDir = 0;
-bool finishEventLatched = false;
+bool runStarted = false;
 
 void setLED(bool r, bool g, bool b)
 {
   digitalWrite(LED_R, r);
   digitalWrite(LED_G, g);
   digitalWrite(LED_B, b);
+}
+
+void setASLSafe()
+{
+  setLED(false, true, false);
+}
+
+void setASLAutonomous()
+{
+  setLED(true, false, false);
+}
+
+void setASLReady()
+{
+  setLED(false, true, false);
+}
+
+bool startButtonPressed()
+{
+  return digitalRead(START_BUTTON_PIN) == START_BUTTON_ACTIVE_LEVEL;
 }
 
 void motorDrive(int left, int right)
@@ -190,67 +223,87 @@ bool centerOnLine(int mask)
 
 void finishAndLock();
 
-bool straightLineDetected(int mask)
+int activeSensorCount(int mask)
 {
-  bool center = (mask & 0b00100) != 0;
-  bool outerLeft = (mask & 0b00001) != 0;
-  bool outerRight = (mask & 0b10000) != 0;
-  return center && !outerLeft && !outerRight;
+  int count = 0;
+
+  for (int i = 0; i < 5; i++)
+  {
+    if (mask & (1 << i))
+    {
+      count++;
+    }
+  }
+
+  return count;
+}
+
+bool normalStraightDetected(int mask, float lineError)
+{
+  return centerOnLine(mask) &&
+         activeSensorCount(mask) <= 3 &&
+         abs(lineError) <= STRAIGHT_ERROR_LIMIT;
 }
 
 void clearFinishLatch()
 {
-  finishConfirmCount = 0;
-  finishStraightStartTime = 0;
-  finishEventLatched = false;
+  finishLineEndStartTime = 0;
 }
 
-bool updateFinishCounter(int mask, float lineError)
+void resetFinishDetection()
 {
-  if (millis() - startTime < FINISH_ENABLE_TIME)
-  {
-    clearFinishLatch();
-    return false;
-  }
+  finishApproachStartTime = 0;
+  finishLineEndStartTime = 0;
+}
 
+void updateFinishApproach(int mask, float lineError)
+{
   if (state != TRACKING)
   {
-    clearFinishLatch();
-    return false;
+    resetFinishDetection();
+    return;
   }
 
-  if (!straightLineDetected(mask) || abs(lineError) > STRAIGHT_ERROR_LIMIT)
+  if (normalStraightDetected(mask, lineError))
   {
     clearFinishLatch();
-    return false;
-  }
-
-  if (finishStraightStartTime == 0)
-  {
-    finishStraightStartTime = millis();
-    return false;
-  }
-
-  if (!finishEventLatched)
-  {
-    finishConfirmCount++;
-
-    if (millis() - finishStraightStartTime >= FINISH_STRAIGHT_CONFIRM_TIME &&
-        finishConfirmCount >= FINISH_STRAIGHT_CONFIRM_COUNT)
+    if (finishApproachStartTime == 0)
     {
-      finishEventCount++;
-      finishEventLatched = true;
-      Serial.printf("FINISH STRAIGHT %d\n", finishEventCount);
-
-      if (finishEventCount >= FINISH_STRAIGHT_EVENT_TARGET)
-      {
-        finishAndLock();
-        return true;
-      }
+      finishApproachStartTime = millis();
     }
+    return;
   }
 
-  return false;
+  resetFinishDetection();
+}
+
+bool handleFinishLineEnd()
+{
+  bool timedApproachReady = finishApproachStartTime != 0 &&
+                            millis() - finishApproachStartTime >= FINISH_APPROACH_STRAIGHT_TIME;
+  bool straightModeApproachReady = straightMode && abs(lastError) <= STRAIGHT_ERROR_LIMIT;
+  bool approachReady = timedApproachReady || straightModeApproachReady;
+  bool recoveryQuiet = millis() - lastRecoveryTime >= FINISH_RECOVERY_IGNORE_TIME;
+
+  if (!approachReady || !recoveryQuiet)
+  {
+    return false;
+  }
+
+  motorBrake();
+
+  if (finishLineEndStartTime == 0)
+  {
+    finishLineEndStartTime = millis();
+    return true;
+  }
+
+  if (millis() - finishLineEndStartTime >= FINISH_LINE_END_CONFIRM_TIME)
+  {
+    finishAndLock();
+  }
+
+  return true;
 }
 
 bool needsBackAlign(int mask)
@@ -260,45 +313,73 @@ bool needsBackAlign(int mask)
   return !centerOnLine(mask) && (outerLeft || outerRight);
 }
 
-void updateStraightTimer(int mask)
+int edgeTurnDirection(int mask, float lineError)
 {
-  if (centerOnLine(mask) && !needsBackAlign(mask) && state == TRACKING)
+  bool outerLeft = (mask & 0b00001) != 0;
+  bool outerRight = (mask & 0b10000) != 0;
+
+  if (outerRight && !outerLeft)
   {
-    if (straightStartTime == 0)
-    {
-      straightStartTime = millis();
-    }
+    return 1;
   }
-  else
+
+  if (outerLeft && !outerRight)
   {
-    straightStartTime = 0;
+    return -1;
   }
+
+  return lineError >= 0 ? 1 : -1;
 }
 
 void stopAndLock()
 {
   state = STOPPED;
-  motorDrive(0, 0);
-  setLED(true, false, false);
-  Serial.println("STOPPED: line lost");
+  motorBrake();
+  setASLSafe();
+  DEBUG_PRINTLN("STOPPED: line lost");
 }
 
 void finishAndLock()
 {
   state = STOPPED;
-  motorDrive(0, 0);
-  setLED(true, false, false);
-  Serial.println("FINISHED");
+  motorBrake();
+  setASLSafe();
+  DEBUG_PRINTLN("FINISHED");
 }
 
-unsigned long currentLostLimit()
+void startRun()
 {
-  if (millis() - startTime >= FINISH_ENABLE_TIME)
-  {
-    return LOST_LIMIT_FINISH_PHASE;
-  }
+  runStarted = true;
+  state = TRACKING;
+  lostTime = 0;
+  alignTime = 0;
+  finishApproachStartTime = 0;
+  finishLineEndStartTime = 0;
+  lastRecoveryTime = 0;
+  error = 0.0;
+  lastError = 0.0;
+  filteredError = 0.0;
+  errorFilterReady = false;
+  straightMode = false;
+  setASLAutonomous();
+  DEBUG_PRINTLN("RUN START");
+}
 
-  return LOST_LIMIT;
+void turnToward(int dir, int forwardSpeed, int reverseSpeed)
+{
+  if (dir > 0)
+  {
+    motorDrive(forwardSpeed, reverseSpeed);
+  }
+  else
+  {
+    motorDrive(reverseSpeed, forwardSpeed);
+  }
+}
+
+void turnAwayFrom(int dir, int forwardSpeed, int reverseSpeed)
+{
+  turnToward(-dir, forwardSpeed, reverseSpeed);
 }
 
 void searchLine()
@@ -307,50 +388,47 @@ void searchLine()
   {
     state = SEARCHING;
     lostTime = millis();
-    setLED(true, false, true);
-    motorDrive(-SEARCH_BACK_SPEED, -SEARCH_BACK_SPEED);
-    Serial.println("SEARCHING");
-    return;
+    lastRecoveryTime = millis();
+    resetFinishDetection();
+    setASLAutonomous();
+    DEBUG_PRINTLN("SEARCHING");
   }
 
   unsigned long elapsed = millis() - lostTime;
 
-  if (elapsed > currentLostLimit())
+  if (elapsed > LOST_LIMIT)
   {
-    lostTime = millis();
-    motorDrive(-SEARCH_BACK_SPEED, -SEARCH_BACK_SPEED);
-    Serial.println("SEARCH RETRY");
+    stopAndLock();
     return;
   }
 
-  if (elapsed < SEARCH_BRAKE_TIME)
+  unsigned long cycleTime = SEARCH_PRIMARY_TIME + SEARCH_REST_TIME + SEARCH_OPPOSITE_TIME + SEARCH_REST_TIME;
+  unsigned long phase = elapsed % cycleTime;
+  int searchDir = lastError >= 0 ? 1 : -1;
+
+  if (phase < SEARCH_PRIMARY_TIME)
+  {
+    turnToward(searchDir, SEARCH_TURN_FORWARD, SEARCH_TURN_REVERSE);
+    return;
+  }
+
+  phase -= SEARCH_PRIMARY_TIME;
+
+  if (phase < SEARCH_REST_TIME)
   {
     motorBrake();
     return;
   }
 
-  if (elapsed < SEARCH_BRAKE_TIME + SEARCH_BACK_TIME)
+  phase -= SEARCH_REST_TIME;
+
+  if (phase < SEARCH_OPPOSITE_TIME)
   {
-    motorDrive(-SEARCH_BACK_SPEED, -SEARCH_BACK_SPEED);
+    turnAwayFrom(searchDir, SEARCH_TURN_FORWARD, SEARCH_TURN_REVERSE);
     return;
   }
 
-  unsigned long phase = (elapsed - SEARCH_BRAKE_TIME - SEARCH_BACK_TIME) % (SEARCH_PULSE_TIME + SEARCH_REST_TIME);
-
-  if (phase >= SEARCH_PULSE_TIME)
-  {
-    motorBrake();
-    return;
-  }
-
-  if (lastError > 0)
-  {
-    motorDrive(SEARCH_TURN_FORWARD, SEARCH_TURN_REVERSE);
-  }
-  else
-  {
-    motorDrive(SEARCH_TURN_REVERSE, SEARCH_TURN_FORWARD);
-  }
+  motorBrake();
 }
 
 void startAligning(int dir)
@@ -358,70 +436,59 @@ void startAligning(int dir)
   state = ALIGNING;
   alignDir = dir;
   alignTime = millis();
-  setLED(false, true, true);
-  Serial.println("BACK ALIGNING");
-}
-
-void driveBackAlign()
-{
-  if (alignDir > 0)
-  {
-    motorDrive(-RIGHT_ALIGN_LEFT_BACK, -RIGHT_ALIGN_RIGHT_BACK);
-  }
-  else
-  {
-    motorDrive(-LEFT_ALIGN_LEFT_BACK, -LEFT_ALIGN_RIGHT_BACK);
-  }
+  lastRecoveryTime = millis();
+  resetFinishDetection();
+  setASLAutonomous();
+  DEBUG_PRINTLN("EDGE ALIGNING");
 }
 
 void alignToLine(int mask)
 {
   unsigned long elapsed = millis() - alignTime;
 
-  if (centerOnLine(mask) && elapsed > ALIGN_BRAKE_TIME)
+  if (centerOnLine(mask))
   {
     state = TRACKING;
-    motorDrive(BASE_SPEED + LEFT_MOTOR_OFFSET, BASE_SPEED);
+    lastRecoveryTime = millis();
+    motorDrive(BASE_SPEED, BASE_SPEED);
     return;
   }
 
   if (elapsed > ALIGN_LIMIT)
   {
-    alignTime = millis();
-    driveBackAlign();
-    Serial.println("ALIGN RETRY");
+    stopAndLock();
     return;
   }
 
-  if (elapsed < ALIGN_BRAKE_TIME)
-  {
-    motorBrake();
-    return;
-  }
-
-  if (elapsed < ALIGN_BRAKE_TIME + CORNER_KICK_TIME)
-  {
-    if (alignDir > 0)
-    {
-      motorDrive(CORNER_KICK_FORWARD, CORNER_KICK_REVERSE);
-    }
-    else
-    {
-      motorDrive(CORNER_KICK_REVERSE, CORNER_KICK_FORWARD);
-    }
-
-    return;
-  }
-
-  driveBackAlign();
+  turnToward(alignDir, ALIGN_TURN_FORWARD, ALIGN_TURN_REVERSE);
 }
 
 void trackLine(float newError)
 {
   state = TRACKING;
-  setLED(false, true, false);
+  setASLAutonomous();
 
-  error = newError;
+  if (!errorFilterReady)
+  {
+    filteredError = newError;
+    errorFilterReady = true;
+  }
+  else
+  {
+    filteredError += ERROR_FILTER_ALPHA * (newError - filteredError);
+  }
+
+  error = filteredError;
+
+  if (abs(error) <= STRAIGHT_ERROR_LIMIT)
+  {
+    straightMode = true;
+  }
+  else if (abs(error) >= STRAIGHT_RELEASE_LIMIT)
+  {
+    straightMode = false;
+  }
+
   float derivative = error - lastError;
   float correction = KP * error + KD * derivative;
   correction = constrain(correction, -MAX_PD_CORRECTION, MAX_PD_CORRECTION);
@@ -429,9 +496,11 @@ void trackLine(float newError)
   int leftSpeed = BASE_SPEED;
   int rightSpeed = BASE_SPEED;
 
-  if (abs(error) <= STRAIGHT_ERROR_LIMIT)
+  if (straightMode)
   {
-    leftSpeed = BASE_SPEED + LEFT_MOTOR_OFFSET;
+    error = 0.0;
+    derivative = 0.0;
+    leftSpeed = BASE_SPEED;
     rightSpeed = BASE_SPEED;
   }
   else
@@ -443,13 +512,12 @@ void trackLine(float newError)
   motorDrive(leftSpeed, rightSpeed);
   lastError = error;
 
-  Serial.printf("E=%.2f D=%.2f L=%d R=%d\n", error, derivative, leftSpeed, rightSpeed);
+  DEBUG_PRINTF("E=%.2f D=%.2f L=%d R=%d\n", error, derivative, leftSpeed, rightSpeed);
 }
 
 void setup()
 {
-  Serial.begin(115200);
-  startTime = millis();
+  DEBUG_BEGIN(115200);
 
   for (int i = 0; i < 5; i++)
   {
@@ -463,21 +531,47 @@ void setup()
   pinMode(LED_R, OUTPUT);
   pinMode(LED_G, OUTPUT);
   pinMode(LED_B, OUTPUT);
+  pinMode(START_BUTTON_PIN, INPUT_PULLUP);
 
   ledcAttach(ENA, PWM_FREQ, PWM_BITS);
   ledcAttach(ENB, PWM_FREQ, PWM_BITS);
 
-  motorDrive(0, 0);
-  setLED(false, false, true);
-  Serial.println("READY");
+  motorBrake();
+  setASLReady();
+  DEBUG_PRINTLN("READY");
 }
 
 void loop()
 {
+  if (!runStarted)
+  {
+    motorBrake();
+    setASLReady();
+
+    if (startButtonPressed())
+    {
+      delay(30);
+      if (startButtonPressed())
+      {
+        while (startButtonPressed())
+        {
+          motorBrake();
+          setASLReady();
+          delay(5);
+        }
+
+        startRun();
+      }
+    }
+
+    delay(20);
+    return;
+  }
+
   if (state == STOPPED)
   {
-    motorDrive(0, 0);
-    setLED(true, false, false);
+    motorBrake();
+    setASLSafe();
     delay(20);
     return;
   }
@@ -488,21 +582,22 @@ void loop()
 
   if (!lineDetected)
   {
-    clearFinishLatch();
+    if (handleFinishLineEnd())
+    {
+      delay(5);
+      return;
+    }
+
+    resetFinishDetection();
     searchLine();
     delay(5);
     return;
   }
 
-  if (updateFinishCounter(sensorMask, newError))
-  {
-    delay(5);
-    return;
-  }
+  updateFinishApproach(sensorMask, newError);
 
   if (state == ALIGNING)
   {
-    straightStartTime = 0;
     alignToLine(sensorMask);
     delay(5);
     return;
@@ -510,13 +605,11 @@ void loop()
 
   if (needsBackAlign(sensorMask))
   {
-    straightStartTime = 0;
-    startAligning(newError > 0 ? 1 : -1);
+    startAligning(edgeTurnDirection(sensorMask, newError));
     delay(5);
     return;
   }
 
-  updateStraightTimer(sensorMask);
   trackLine(newError);
   delay(5);
 }
